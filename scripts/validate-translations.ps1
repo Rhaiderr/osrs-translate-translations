@@ -23,6 +23,75 @@ if ($languageDirectories.Count -eq 0) {
 
 $invalidFiles = New-Object System.Collections.Generic.List[string]
 
+function Get-JsonErrorLocation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Content,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Message
+    )
+
+    $lineMatch = [regex]::Match(
+        $Message,
+        'line\s+(\d+),\s+position\s+(\d+)',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if ($lineMatch.Success) {
+        return "linha $($lineMatch.Groups[1].Value), coluna $($lineMatch.Groups[2].Value)"
+    }
+
+    $characterMatch = [regex]::Match($Message, '\((\d+)\)')
+    if (-not $characterMatch.Success) {
+        return $null
+    }
+
+    $position = [int]$characterMatch.Groups[1].Value
+    $offset = [Math]::Max(0, [Math]::Min($position - 1, $Content.Length))
+    $prefix = $Content.Substring(0, $offset)
+    $line = ([regex]::Matches($prefix, "`n")).Count + 1
+    $lastNewLine = $prefix.LastIndexOf("`n")
+    $column = $offset - $lastNewLine
+    return "linha $line, coluna $column"
+}
+
+function Test-TranslationJson {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path
+    )
+
+    $content = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $convertFromJson = Get-Command ConvertFrom-Json
+
+    try {
+        if ($convertFromJson.Parameters.ContainsKey('AsHashtable')) {
+            $json = ConvertFrom-Json -InputObject $content -AsHashtable
+        } else {
+            Add-Type -AssemblyName System.Web.Extensions
+            $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+            $serializer.MaxJsonLength = [int]::MaxValue
+            $json = $serializer.DeserializeObject($content)
+        }
+    } catch {
+        $location = Get-JsonErrorLocation -Content $content -Message $_.Exception.Message
+        if ($null -ne $location) {
+            throw "$location - $($_.Exception.Message)"
+        }
+        throw
+    }
+
+    if ($json -isnot [System.Collections.IDictionary]) {
+        throw 'a raiz deve ser um objeto JSON'
+    }
+
+    foreach ($entry in $json.GetEnumerator()) {
+        if ($entry.Value -isnot [string]) {
+            throw "o valor da chave '$($entry.Key)' deve ser texto"
+        }
+    }
+}
+
 foreach ($languageDirectory in $languageDirectories) {
     foreach ($fileName in $requiredFiles) {
         $filePath = Join-Path $languageDirectory.FullName $fileName
@@ -32,18 +101,7 @@ foreach ($languageDirectory in $languageDirectories) {
         }
 
         try {
-            $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
-            $json = ConvertFrom-Json -InputObject $content
-
-            if ($json -isnot [pscustomobject]) {
-                throw 'a raiz deve ser um objeto JSON'
-            }
-
-            foreach ($property in $json.PSObject.Properties) {
-                if ($property.Value -isnot [string]) {
-                    throw "o valor da chave '$($property.Name)' deve ser texto"
-                }
-            }
+            Test-TranslationJson -Path $filePath
         } catch {
             [void]$invalidFiles.Add("$filePath - $($_.Exception.Message)")
         }
